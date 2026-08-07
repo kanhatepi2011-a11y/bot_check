@@ -1,0 +1,16 @@
+[Unit]
+Description=TikTok Video Quality Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_LINUX_USER
+WorkingDirectory=/opt/tiktok-quality-bot
+ExecStart=/opt/tiktok-quality-bot/.venv/bin/python /opt/tiktok-quality-bot/telegram_bot.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
