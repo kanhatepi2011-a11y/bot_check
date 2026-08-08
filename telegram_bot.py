@@ -34,6 +34,10 @@ from tiktok_checker import (
 load_dotenv()
 
 BOT_TOKEN: Final[str] = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+
+TELEGRAM_BOT_API_URL: Final[str] = (
+    os.getenv("TELEGRAM_BOT_API_URL", "").strip().rstrip("/")
+)
 MAX_CONCURRENT_JOBS: Final[int] = max(
     1,
     int(os.getenv("MAX_CONCURRENT_JOBS", os.getenv("MAX_CONCURRENT_CHECKS", "2"))),
@@ -186,6 +190,15 @@ async def download_from_url(update: Update, url: str) -> None:
                 )
 
                 size_mb = video_path.stat().st_size / (1024 * 1024)
+
+                if not TELEGRAM_BOT_API_URL and size_mb > 49:
+                    await status.edit_text(
+                        "❌ វីដេអូនេះធំពេកសម្រាប់ Telegram Bot API ផ្លូវការ។\n"
+                        f"📁 Size: {size_mb:.2f} MB\n"
+                        "💡 ប្រើ Telegram Local Bot API Server ដើម្បីផ្ញើ file ធំជាងនេះ។"
+                    )
+                    return
+
                 await status.edit_text(
                     f"📤 <b>កំពុងផ្ញើវីដេអូ...</b>\n"
                     f"📁 Size: <code>{size_mb:.2f} MB</code>",
@@ -237,10 +250,17 @@ async def download_from_url(update: Update, url: str) -> None:
         )
     except (NetworkError, TelegramError) as exc:
         logger.warning("Telegram file upload failed: %s", exc)
-        await status.edit_text(
-            "❌ Download បាន ប៉ុន្តែ Telegram មិនអាចទទួល file នេះបាន។\n"
-            "File អាចធំពេក ឬ connection server មិនស្ថិរភាព។"
-        )
+
+        if TELEGRAM_BOT_API_URL:
+            await status.edit_text(
+                "❌ Download បាន ប៉ុន្តែមិនអាចផ្ញើ file បាន។\n"
+                "Local Bot API អាចមានបញ្ហា ឬ file ធំពេក។"
+            )
+        else:
+            await status.edit_text(
+                "❌ វីដេអូ Download បាន ប៉ុន្តែមិនអាចផ្ញើតាម Telegram Bot API ផ្លូវការបាន។\n"
+                "File អាចធំពេក។ សម្រាប់ file ធំ ត្រូវប្រើ Telegram Local Bot API Server។"
+            )
     except Exception:
         logger.exception("Unhandled download error")
         await status.edit_text("❌ មានកំហុសក្នុង Server ពេល Download។")
@@ -278,7 +298,20 @@ def main() -> None:
             "TELEGRAM_BOT_TOKEN មិនទាន់បានកំណត់។ Copy .env.example ទៅ .env រួចបញ្ចូល token។"
         )
 
-    application = Application.builder().token(BOT_TOKEN).build()
+    builder = Application.builder().token(BOT_TOKEN)
+
+    if TELEGRAM_BOT_API_URL:
+        logger.info("Using Telegram Local Bot API: %s", TELEGRAM_BOT_API_URL)
+        builder = (
+            builder
+            .base_url(f"{TELEGRAM_BOT_API_URL}/bot")
+            .base_file_url(f"{TELEGRAM_BOT_API_URL}/file/bot")
+            .local_mode(True)
+        )
+    else:
+        logger.info("Using official Telegram Bot API")
+
+    application = builder.build()
 
     # Only two commands:
     # /check <link>    -> analyze video quality
