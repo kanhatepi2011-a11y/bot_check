@@ -167,7 +167,7 @@ def find_cookie_file() -> Optional[Path]:
 def chrome_impersonation_available() -> bool:
     """Return True only when yt-dlp has an available Chrome impersonation target."""
     result = run_command(
-        ["yt-dlp", "--list-impersonate-targets"],
+        [sys.executable, "-m", "yt_dlp", "--list-impersonate-targets"],
         capture_output=True,
         timeout=30,
     )
@@ -192,15 +192,24 @@ def clean_partial_downloads(output_dir: Path) -> None:
 
 
 def download_video(url: str, output_dir: Path) -> Path:
-    require_command("yt-dlp", "python -m pip install -U --pre 'yt-dlp[default]'")
-    require_command("ffmpeg", "pkg install ffmpeg -y")
+    try:
+        import yt_dlp  # noqa: F401
+    except ImportError as exc:
+        raise CheckerError(
+            "រកមិនឃើញ Python package 'yt-dlp'។ "
+            "សូមដំឡើងដោយ: python -m pip install -U yt-dlp"
+        ) from exc
+
+    require_command("ffmpeg", "apt install ffmpeg -y")
 
     output_template = str(output_dir / "video.%(ext)s")
     cookie_file = find_cookie_file()
     can_impersonate = chrome_impersonation_available()
 
     common = [
-        "yt-dlp",
+        sys.executable,
+        "-m",
+        "yt_dlp",
         "--no-playlist",
         "--newline",
         "--no-warnings",
@@ -302,6 +311,10 @@ def download_video(url: str, output_dir: Path) -> Path:
     # Keep detailed yt-dlp output only in the server console.
     # Telegram users receive a short, clean error message.
     
+    if last_detail:
+        print(last_detail, file=sys.stderr)
+    raise CheckerError("មិនអាចពិនិត្យវីដេអូនេះបាន")
+
 
 
 def parse_fraction(value: object) -> float:

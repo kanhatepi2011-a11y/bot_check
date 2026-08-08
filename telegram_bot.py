@@ -42,12 +42,6 @@ JOB_TIMEOUT_SECONDS: Final[int] = max(
     60,
     int(os.getenv("JOB_TIMEOUT_SECONDS", os.getenv("CHECK_TIMEOUT_SECONDS", "420"))),
 )
-ALLOWED_USER_IDS: Final[set[int]] = {
-    int(item.strip())
-    for item in os.getenv("ALLOWED_USER_IDS", "").split(",")
-    if item.strip().isdigit()
-}
-
 job_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 
 logging.basicConfig(
@@ -56,12 +50,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("tiktok-quality-bot")
 
-
-def authorized(update: Update) -> bool:
-    if not ALLOWED_USER_IDS:
-        return True
-    user = update.effective_user
-    return bool(user and user.id in ALLOWED_USER_IDS)
 
 
 def extract_url(text: str) -> str | None:
@@ -128,17 +116,10 @@ def format_report(report: VideoReport) -> str:
     )
 
 
-async def reject_unauthorized(update: Update) -> bool:
-    if authorized(update):
-        return False
-    if update.effective_message:
-        await update.effective_message.reply_text("⛔ អ្នកមិនមានសិទ្ធិប្រើ bot នេះទេ។")
-    return True
-
 
 async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
-    if message is None or await reject_unauthorized(update):
+    if message is None:
         return
 
     url = extract_url(message.text or "")
@@ -177,7 +158,7 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def download_from_url(update: Update, url: str) -> None:
     message = update.effective_message
-    if message is None or await reject_unauthorized(update):
+    if message is None:
         return
 
     if not is_url(url):

@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+.git/
+.gitignore
+venv/
+.venv/
+tmp/
+*.mp4
+cookies.txt
