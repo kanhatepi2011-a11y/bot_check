@@ -430,61 +430,152 @@ def pick_stream(streams: list[dict], codec_type: str) -> dict:
     return {}
 
 
-THEZIESS_METHOD_MARKERS = (
-    "theziessmethod.site",
-    "theziess method",
+METHOD_TAG_KEYS = (
+    "method",
+    "artist",
 )
 
 
-def _contains_theziess_marker(value: object) -> bool:
-    """Recursively inspect ffprobe metadata values for Theziess Method markers."""
-    if isinstance(value, dict):
-        return any(_contains_theziess_marker(item) for item in value.values())
-    if isinstance(value, (list, tuple)):
-        return any(_contains_theziess_marker(item) for item in value)
+def _clean_method_text(value: object) -> str:
+    """Normalize a metadata value while preserving the text stored in the video."""
     if value is None:
-        return False
+        return ""
 
-    text = str(value).casefold()
-    return any(marker in text for marker in THEZIESS_METHOD_MARKERS)
+    text = str(value).replace("\x00", "").strip()
+    if not text:
+        return ""
+
+    # Keep the Telegram report safe/readable if a malformed file contains an
+    # unexpectedly huge metadata field.
+    return text[:256]
 
 
-def _raw_file_contains_marker(file_path: Path) -> bool:
+def _extract_method_from_ffprobe(ffprobe_data: dict) -> str:
     """
-    Scan the MP4 bytes without loading the whole video into memory.
+    Read the actual Method text from video metadata.
 
-    This is a fallback for MP4 metadata that some ffprobe builds/containers do
-    not expose as a normal format tag.
+    Priority:
+      1. format.tags.method
+      2. format.tags.artist
+      3. stream.tags.method / stream.tags.artist
+
+    The patcher used by Theziess Method stores its value in the MP4 Artist
+    metadata field (©ART), which ffprobe exposes as `artist`.
     """
-    markers = tuple(marker.encode("utf-8") for marker in THEZIESS_METHOD_MARKERS)
-    overlap = max(len(marker) for marker in markers) - 1
-    tail = b""
+    format_tags = (ffprobe_data.get("format") or {}).get("tags") or {}
 
+    # Metadata keys are case-insensitive in practice, so normalize lookup.
+    normalized_format_tags = {
+        str(key).casefold(): value
+        for key, value in format_tags.items()
+    }
+
+    for key in METHOD_TAG_KEYS:
+        value = _clean_method_text(normalized_format_tags.get(key))
+        if value:
+            return value
+
+    for stream in ffprobe_data.get("streams") or []:
+        stream_tags = (stream or {}).get("tags") or {}
+        normalized_stream_tags = {
+            str(key).casefold(): value
+            for key, value in stream_tags.items()
+        }
+
+        for key in METHOD_TAG_KEYS:
+            value = _clean_method_text(normalized_stream_tags.get(key))
+            if value:
+                return value
+
+    return ""
+
+
+def _extract_mp4_artist_atom(file_path: Path) -> str:
+    """
+    Fallback: extract the text stored in a QuickTime/iTunes ©ART atom directly
+    from MP4 bytes when ffprobe does not expose it.
+
+    Expected structure:
+        ©ART
+          └── data
+               └── <UTF-8 text>
+    """
     try:
-        with file_path.open("rb") as file:
-            while True:
-                chunk = file.read(1024 * 1024)
-                if not chunk:
-                    break
-
-                data = (tail + chunk).lower()
-                if any(marker in data for marker in markers):
-                    return True
-
-                tail = data[-overlap:] if overlap > 0 else b""
+        data = file_path.read_bytes()
     except OSError:
-        return False
+        return ""
 
-    return False
+    marker = b"\xa9ART"
+    search_from = 0
+
+    while True:
+        type_pos = data.find(marker, search_from)
+        if type_pos < 0:
+            return ""
+
+        atom_start = type_pos - 4
+        search_from = type_pos + len(marker)
+
+        if atom_start < 0 or atom_start + 8 > len(data):
+            continue
+
+        atom_size = int.from_bytes(data[atom_start:atom_start + 4], "big")
+        if atom_size < 8:
+            continue
+
+        atom_end = atom_start + atom_size
+        if atom_end > len(data):
+            continue
+
+        data_type_pos = data.find(b"data", type_pos + 4, atom_end)
+        if data_type_pos < 4:
+            continue
+
+        data_atom_start = data_type_pos - 4
+        data_atom_size = int.from_bytes(
+            data[data_atom_start:data_atom_start + 4],
+            "big",
+        )
+        data_atom_end = data_atom_start + data_atom_size
+
+        # data atom = 8-byte header + 4-byte type/flags + 4-byte locale + text
+        text_start = data_atom_start + 16
+        if (
+            data_atom_size < 16
+            or text_start > data_atom_end
+            or data_atom_end > atom_end
+        ):
+            continue
+
+        raw_text = data[text_start:data_atom_end]
+
+        for encoding in ("utf-8", "latin1"):
+            try:
+                value = _clean_method_text(raw_text.decode(encoding))
+            except UnicodeDecodeError:
+                continue
+
+            if value:
+                return value
+
+    return ""
 
 
 def detect_theziess_method(file_path: Path, ffprobe_data: dict) -> tuple[bool, str]:
-    """Detect Theziess Method from ffprobe metadata, then raw MP4 bytes."""
-    if _contains_theziess_marker(ffprobe_data):
-        return True, "TheziessMethod.site"
+    """
+    Extract Method from the video itself instead of returning a hard-coded name.
 
-    if _raw_file_contains_marker(file_path):
-        return True, "TheziessMethod.site"
+    Examples:
+      artist=TheziessMethod.site -> TheziessMethod.site
+      artist=editingnews.com     -> editingnews.com
+    """
+    method_text = _extract_method_from_ffprobe(ffprobe_data)
+
+    if not method_text:
+        method_text = _extract_mp4_artist_atom(file_path)
+
+    if method_text:
+        return True, method_text
 
     return False, "Not detected"
 
