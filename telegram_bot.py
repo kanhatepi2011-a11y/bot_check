@@ -22,6 +22,8 @@ from telegram.ext import (
     filters,
 )
 
+from fps_api_server import start_fps_api_server
+
 from tiktok_checker import (
     CheckerError,
     VideoReport,
@@ -293,6 +295,13 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 def main() -> None:
+    # Start the HTTP FPS API in the same process as the Telegram bot.
+    # PEACHY allocation port 3008 should point to this listener.
+    try:
+        start_fps_api_server()
+    except OSError as exc:
+        logger.error("Unable to start FPS API: %s", exc)
+
     if not BOT_TOKEN:
         raise SystemExit(
             "TELEGRAM_BOT_TOKEN មិនទាន់បានកំណត់។ Copy .env.example ទៅ .env រួចបញ្ចូល token។"

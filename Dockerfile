@@ -20,3 +20,5 @@ RUN pip install --no-cache-dir --upgrade pip && \
 COPY . .
 
 CMD ["python", "telegram_bot.py"]
+
+EXPOSE 3008
