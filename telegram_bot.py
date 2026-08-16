@@ -29,6 +29,7 @@ from tiktok_checker import (
     VideoReport,
     download_video,
     format_duration,
+    get_temp_root,
     is_url,
     process_source,
 )
@@ -115,7 +116,9 @@ def format_report(report: VideoReport) -> str:
         f"🔊 <b>Audio Codec:</b> {escape(report.audio_codec.upper())}\n"
         f"🎨 <b>Pixel Format:</b> {escape(report.pixel_format)}\n"
         f"⏱️ <b>Duration:</b> {format_duration(report.duration_seconds)}\n"
-        f"📁 <b>File Size:</b> {report.file_size_mb:.2f} MB\n\n"
+        f"📁 <b>File Size:</b> {report.file_size_mb:.2f} MB\n"
+        f"🧩 <b>Method:</b> "
+        f"{escape(report.method_name) if report.method_detected else '❌ Not detected'}\n\n"
         f"{quality_emoji(report.quality_score)} <b>Quality:</b> "
         f"{escape(report.quality_score)} ({report.fps:.0f} FPS)\n"
         "━━━━━━━━━━━━━━━━━━━━"
@@ -184,7 +187,13 @@ async def download_from_url(update: Update, url: str) -> None:
 
     try:
         async with job_semaphore:
-            with tempfile.TemporaryDirectory(prefix="telegram_tiktok_download_") as temp_name:
+            # Keep large downloads on the server's persistent disk allocation,
+            # not the small container /tmp tmpfs.
+            temp_root = get_temp_root()
+            with tempfile.TemporaryDirectory(
+                prefix="telegram_tiktok_download_",
+                dir=str(temp_root),
+            ) as temp_name:
                 temp_dir = Path(temp_name)
                 video_path = await asyncio.wait_for(
                     asyncio.to_thread(download_video, url, temp_dir),

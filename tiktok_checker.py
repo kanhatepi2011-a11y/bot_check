@@ -34,6 +34,35 @@ APP_NAME = "TikTok FPS Quality Checker"
 LINE = "=" * 58
 
 
+def get_temp_root() -> Path:
+    """
+    Return a disk-backed temp directory for large TikTok videos.
+
+    System /tmp is often a small tmpfs inside hosting containers, so 4K videos
+    can fail with Errno 28 even when the server's main disk still has space.
+    BOT_TEMP_DIR can override the location. By default we keep temporary files
+    beside this bot project, on the same persistent storage allocation.
+    """
+    configured = os.environ.get("BOT_TEMP_DIR", "").strip()
+    root = (
+        Path(configured).expanduser()
+        if configured
+        else Path(__file__).resolve().parent / ".bot_tmp"
+    )
+
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise CheckerError(
+            f"មិនអាចបង្កើត temp folder បាន: {root} ({exc})"
+        ) from exc
+
+    if not root.is_dir():
+        raise CheckerError(f"Temp path មិនមែនជា folder: {root}")
+
+    return root
+
+
 class Color:
     RESET = "\033[0m"
     BOLD = "\033[1m"
@@ -67,6 +96,8 @@ class VideoReport:
     file_size_mb: float
     quality_score: str
     downloaded: bool
+    method_detected: bool = False
+    method_name: str = "Not detected"
     error: str = ""
 
     @property
@@ -123,6 +154,14 @@ def run_command(
     timeout: Optional[int] = None,
 ) -> subprocess.CompletedProcess[str]:
     try:
+        # Force yt-dlp/ffmpeg and other child processes to use the bot's
+        # disk-backed temporary directory instead of a possibly tiny /tmp tmpfs.
+        child_env = os.environ.copy()
+        temp_root = get_temp_root()
+        child_env["TMPDIR"] = str(temp_root)
+        child_env["TMP"] = str(temp_root)
+        child_env["TEMP"] = str(temp_root)
+
         return subprocess.run(
             command,
             check=False,
@@ -130,6 +169,7 @@ def run_command(
             stdout=subprocess.PIPE if capture_output else None,
             stderr=subprocess.PIPE if capture_output else None,
             timeout=timeout,
+            env=child_env,
         )
     except FileNotFoundError as exc:
         raise CheckerError(f"រកមិនឃើញ command: {command[0]}") from exc
@@ -390,6 +430,65 @@ def pick_stream(streams: list[dict], codec_type: str) -> dict:
     return {}
 
 
+THEZIESS_METHOD_MARKERS = (
+    "theziessmethod.site",
+    "theziess method",
+)
+
+
+def _contains_theziess_marker(value: object) -> bool:
+    """Recursively inspect ffprobe metadata values for Theziess Method markers."""
+    if isinstance(value, dict):
+        return any(_contains_theziess_marker(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_theziess_marker(item) for item in value)
+    if value is None:
+        return False
+
+    text = str(value).casefold()
+    return any(marker in text for marker in THEZIESS_METHOD_MARKERS)
+
+
+def _raw_file_contains_marker(file_path: Path) -> bool:
+    """
+    Scan the MP4 bytes without loading the whole video into memory.
+
+    This is a fallback for MP4 metadata that some ffprobe builds/containers do
+    not expose as a normal format tag.
+    """
+    markers = tuple(marker.encode("utf-8") for marker in THEZIESS_METHOD_MARKERS)
+    overlap = max(len(marker) for marker in markers) - 1
+    tail = b""
+
+    try:
+        with file_path.open("rb") as file:
+            while True:
+                chunk = file.read(1024 * 1024)
+                if not chunk:
+                    break
+
+                data = (tail + chunk).lower()
+                if any(marker in data for marker in markers):
+                    return True
+
+                tail = data[-overlap:] if overlap > 0 else b""
+    except OSError:
+        return False
+
+    return False
+
+
+def detect_theziess_method(file_path: Path, ffprobe_data: dict) -> tuple[bool, str]:
+    """Detect Theziess Method from ffprobe metadata, then raw MP4 bytes."""
+    if _contains_theziess_marker(ffprobe_data):
+        return True, "TheziessMethod.site"
+
+    if _raw_file_contains_marker(file_path):
+        return True, "TheziessMethod.site"
+
+    return False, "Not detected"
+
+
 def analyze_video(file_path: Path, source: str, downloaded: bool) -> VideoReport:
     require_command("ffprobe", "pkg install ffmpeg -y")
 
@@ -459,6 +558,7 @@ def analyze_video(file_path: Path, source: str, downloaded: bool) -> VideoReport
 
     label = resolution_label(width, height)
     score = quality_score(fps, width, height, video_kbps)
+    method_detected, method_name = detect_theziess_method(file_path, data)
 
     return VideoReport(
         source=source,
@@ -476,12 +576,20 @@ def analyze_video(file_path: Path, source: str, downloaded: bool) -> VideoReport
         file_size_mb=file_size_mb,
         quality_score=score,
         downloaded=downloaded,
+        method_detected=method_detected,
+        method_name=method_name,
     )
 
 
 def process_source(source: str) -> VideoReport:
     if is_url(source):
-        with tempfile.TemporaryDirectory(prefix="tiktok_checker_") as temp_name:
+        # IMPORTANT: do not use the system /tmp here. Hosting containers often
+        # mount /tmp as a small tmpfs, which breaks large 2K/4K downloads.
+        temp_root = get_temp_root()
+        with tempfile.TemporaryDirectory(
+            prefix="tiktok_checker_",
+            dir=str(temp_root),
+        ) as temp_name:
             temp_dir = Path(temp_name)
             file_path = download_video(source, temp_dir)
             return analyze_video(file_path, source=source, downloaded=True)
@@ -528,6 +636,8 @@ def display_report(report: VideoReport) -> None:
     print(f"🎨 Pixel format : {report.pixel_format}")
     print(f"⏱️ Duration     : {format_duration(report.duration_seconds)}")
     print(f"📦 File size    : {report.file_size_mb:.2f} MB")
+    method_status = f"✅ {report.method_name}" if report.method_detected else "❌ Not detected"
+    print(f"🧩 Method       : {method_status}")
     print(LINE)
     color = score_color(report.quality_score)
     print(
@@ -554,6 +664,8 @@ CSV_FIELDS = [
     "file_size_mb",
     "quality_score",
     "downloaded",
+    "method_detected",
+    "method_name",
     "error",
 ]
 
