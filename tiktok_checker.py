@@ -19,6 +19,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -32,6 +33,10 @@ from urllib.parse import urlparse
 
 APP_NAME = "TikTok FPS Quality Checker"
 LINE = "=" * 58
+TIKTOK_FORMAT_SELECTOR = (
+    os.environ.get("TIKTOK_FORMAT_SELECTOR", "").strip()
+    or "b[ext=mp4]/b/bv*+ba"
+)
 
 
 def get_temp_root() -> Path:
@@ -269,7 +274,10 @@ def download_video(url: str, output_dir: Path) -> Path:
         "--retry-sleep",
         "http:1",
         "-f",
-        "bv*+ba/b",
+        # Prefer TikTok's original single-file MP4. Merging separate streams
+        # can create a new container and discard the Method/Artist metadata
+        # that this checker is expected to read.
+        TIKTOK_FORMAT_SELECTOR,
         "-o",
         output_template,
     ]
@@ -430,9 +438,54 @@ def pick_stream(streams: list[dict], codec_type: str) -> dict:
     return {}
 
 
-METHOD_TAG_KEYS = (
+PRIMARY_METHOD_TAG_KEYS = (
     "method",
     "artist",
+)
+
+SECONDARY_METHOD_TAG_KEYS = (
+    "album_artist",
+    "albumartist",
+    "comment",
+    "description",
+    "synopsis",
+    "copyright",
+    "encoded_by",
+    "encodedby",
+    "publisher",
+    "composer",
+    "software",
+    "title",
+)
+
+METHOD_PHRASE_RE = re.compile(
+    r"(?:\b(?:patched|processed|compressed|encoded|edited)\s+by\b|"
+    r"\b(?:patcher|method)\b|\bcompress(?:ed|ion|or|base)?\b)",
+    re.IGNORECASE,
+)
+METHOD_DOMAIN_RE = re.compile(
+    r"(?<![\w@])(?:https?://)?(?:www\.)?"
+    r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}",
+    re.IGNORECASE,
+)
+IGNORED_METHOD_DOMAINS = (
+    "tiktok.com",
+    "tiktokcdn.com",
+    "tiktokv.com",
+    "muscdn.com",
+)
+
+# QuickTime/iTunes and 3GPP metadata atoms which commonly hold branding or
+# patcher text. Some encoders use a standard `data` child; others expose the
+# same values to ffprobe as format/stream tags.
+METHOD_ATOM_TYPES = (
+    (b"\xa9ART", True),   # Artist
+    (b"\xa9cmt", False),  # Comment
+    (b"desc", False),     # Description
+    (b"ldes", False),     # Long description
+    (b"cprt", False),     # Copyright
+    (b"\xa9too", False),  # Encoder/tool
+    (b"auth", False),     # 3GPP author
 )
 
 
@@ -441,13 +494,70 @@ def _clean_method_text(value: object) -> str:
     if value is None:
         return ""
 
-    text = str(value).replace("\x00", "").strip()
+    text = "".join(
+        character
+        for character in str(value).replace("\x00", "")
+        if character in "\t\n\r" or ord(character) >= 32
+    )
+    text = " ".join(text.split()).strip()
     if not text:
+        return ""
+
+    if text.casefold() in {"not detected", "unknown", "none", "n/a"}:
         return ""
 
     # Keep the Telegram report safe/readable if a malformed file contains an
     # unexpectedly huge metadata field.
     return text[:256]
+
+
+def _looks_like_method_text(value: str) -> bool:
+    """Return True for an actual patcher/method marker, not generic media tags."""
+    text = _clean_method_text(value)
+    if not text:
+        return False
+
+    if METHOD_PHRASE_RE.search(text):
+        return True
+
+    for match in METHOD_DOMAIN_RE.finditer(text):
+        domain = re.sub(r"^https?://", "", match.group(0), flags=re.IGNORECASE)
+        domain = domain.removeprefix("www.").casefold()
+        if not any(domain == blocked or domain.endswith(f".{blocked}") for blocked in IGNORED_METHOD_DOMAINS):
+            return True
+
+    return False
+
+
+def _extract_method_from_tags(tags: object) -> str:
+    if not isinstance(tags, dict):
+        return ""
+
+    normalized = {str(key).casefold(): value for key, value in tags.items()}
+
+    # Preserve the existing behavior for explicit Method and Artist fields.
+    for key in PRIMARY_METHOD_TAG_KEYS:
+        value = _clean_method_text(normalized.get(key))
+        if value:
+            return value
+
+    # Lower-confidence fields are accepted only when their value looks like a
+    # real patcher/method marker. This prevents a normal title or description
+    # from being reported as the Method.
+    for key in SECONDARY_METHOD_TAG_KEYS:
+        value = _clean_method_text(normalized.get(key))
+        if value and _looks_like_method_text(value):
+            return value
+
+    # Support custom mdta keys such as com.vendor.patch.method.
+    for key, raw_value in normalized.items():
+        if not any(token in key for token in ("method", "patch", "artist", "comment", "description")):
+            continue
+        value = _clean_method_text(raw_value)
+        if value and _looks_like_method_text(value):
+            return value
+
+    return ""
 
 
 def _extract_method_from_ffprobe(ffprobe_data: dict) -> str:
@@ -457,105 +567,155 @@ def _extract_method_from_ffprobe(ffprobe_data: dict) -> str:
     Priority:
       1. format.tags.method
       2. format.tags.artist
-      3. stream.tags.method / stream.tags.artist
+      3. comment/description/copyright/custom mdta tags containing a real
+         patcher marker
+      4. equivalent stream tags
 
     The patcher used by Theziess Method stores its value in the MP4 Artist
     metadata field (©ART), which ffprobe exposes as `artist`.
     """
     format_tags = (ffprobe_data.get("format") or {}).get("tags") or {}
-
-    # Metadata keys are case-insensitive in practice, so normalize lookup.
-    normalized_format_tags = {
-        str(key).casefold(): value
-        for key, value in format_tags.items()
-    }
-
-    for key in METHOD_TAG_KEYS:
-        value = _clean_method_text(normalized_format_tags.get(key))
-        if value:
-            return value
+    value = _extract_method_from_tags(format_tags)
+    if value:
+        return value
 
     for stream in ffprobe_data.get("streams") or []:
         stream_tags = (stream or {}).get("tags") or {}
-        normalized_stream_tags = {
-            str(key).casefold(): value
-            for key, value in stream_tags.items()
-        }
-
-        for key in METHOD_TAG_KEYS:
-            value = _clean_method_text(normalized_stream_tags.get(key))
-            if value:
-                return value
+        value = _extract_method_from_tags(stream_tags)
+        if value:
+            return value
 
     return ""
 
 
+def _read_mp4_atom(data: bytes, start: int, limit: int) -> tuple[int, int] | None:
+    """Return (header_size, end) for one validated MP4 atom."""
+    if start < 0 or start + 8 > limit:
+        return None
+
+    size = int.from_bytes(data[start:start + 4], "big")
+    header_size = 8
+
+    if size == 1:
+        if start + 16 > limit:
+            return None
+        size = int.from_bytes(data[start + 8:start + 16], "big")
+        header_size = 16
+    elif size == 0:
+        size = limit - start
+
+    if size < header_size or start + size > limit:
+        return None
+    return header_size, start + size
+
+
+def _decode_metadata_payload(raw_text: bytes) -> str:
+    for encoding in ("utf-8-sig", "utf-16", "utf-16-be", "utf-16-le", "latin1"):
+        try:
+            value = _clean_method_text(raw_text.decode(encoding))
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+        if value:
+            return value
+    return ""
+
+
+def _extract_data_child_text(data: bytes, type_pos: int, limit: int) -> str:
+    atom_start = type_pos - 4
+    atom = _read_mp4_atom(data, atom_start, limit)
+    if not atom:
+        return ""
+
+    _, atom_end = atom
+    data_type_pos = data.find(b"data", type_pos + 4, atom_end)
+    if data_type_pos < 4:
+        return ""
+
+    data_atom_start = data_type_pos - 4
+    data_atom = _read_mp4_atom(data, data_atom_start, atom_end)
+    if not data_atom:
+        return ""
+
+    data_header_size, data_atom_end = data_atom
+    # `data` payload begins with 4-byte type/flags and 4-byte locale.
+    text_start = data_atom_start + data_header_size + 8
+    if text_start > data_atom_end:
+        return ""
+
+    return _decode_metadata_payload(data[text_start:data_atom_end])
+
+
+def _top_level_moov_ranges(data: bytes) -> list[tuple[int, int]]:
+    ranges: list[tuple[int, int]] = []
+    offset = 0
+
+    while offset + 8 <= len(data):
+        atom = _read_mp4_atom(data, offset, len(data))
+        if not atom:
+            break
+        _, atom_end = atom
+        if data[offset + 4:offset + 8] == b"moov":
+            ranges.append((offset, atom_end))
+        if atom_end <= offset:
+            break
+        offset = atom_end
+
+    return ranges
+
+
 def _extract_mp4_artist_atom(file_path: Path) -> str:
     """
-    Fallback: extract the text stored in a QuickTime/iTunes ©ART atom directly
-    from MP4 bytes when ffprobe does not expose it.
-
-    Expected structure:
-        ©ART
-          └── data
-               └── <UTF-8 text>
+    Fallback: inspect real MP4/QuickTime metadata atoms when ffprobe does not
+    expose the tag. ©ART is highest priority, followed by comment,
+    description, copyright, encoder, 3GPP and mdta-style data values.
     """
     try:
         data = file_path.read_bytes()
     except OSError:
         return ""
 
-    marker = b"\xa9ART"
-    search_from = 0
+    for marker, is_primary in METHOD_ATOM_TYPES:
+        search_from = 0
+        while True:
+            type_pos = data.find(marker, search_from)
+            if type_pos < 0:
+                break
+            search_from = type_pos + len(marker)
+            value = _extract_data_child_text(data, type_pos, len(data))
+            if value and (is_primary or _looks_like_method_text(value)):
+                return value
 
-    while True:
-        type_pos = data.find(marker, search_from)
-        if type_pos < 0:
-            return ""
-
-        atom_start = type_pos - 4
-        search_from = type_pos + len(marker)
-
-        if atom_start < 0 or atom_start + 8 > len(data):
-            continue
-
-        atom_size = int.from_bytes(data[atom_start:atom_start + 4], "big")
-        if atom_size < 8:
-            continue
-
-        atom_end = atom_start + atom_size
-        if atom_end > len(data):
-            continue
-
-        data_type_pos = data.find(b"data", type_pos + 4, atom_end)
-        if data_type_pos < 4:
-            continue
-
-        data_atom_start = data_type_pos - 4
-        data_atom_size = int.from_bytes(
-            data[data_atom_start:data_atom_start + 4],
-            "big",
-        )
-        data_atom_end = data_atom_start + data_atom_size
-
-        # data atom = 8-byte header + 4-byte type/flags + 4-byte locale + text
-        text_start = data_atom_start + 16
-        if (
-            data_atom_size < 16
-            or text_start > data_atom_end
-            or data_atom_end > atom_end
-        ):
-            continue
-
-        raw_text = data[text_start:data_atom_end]
-
-        for encoding in ("utf-8", "latin1"):
-            try:
-                value = _clean_method_text(raw_text.decode(encoding))
-            except UnicodeDecodeError:
+    # mdta metadata uses numeric ilst item types, so scan validated `data`
+    # atoms inside moov and accept only text with a method/patcher signal.
+    moov_ranges = _top_level_moov_ranges(data)
+    for moov_start, moov_end in moov_ranges:
+        search_from = moov_start
+        while True:
+            data_type_pos = data.find(b"data", search_from, moov_end)
+            if data_type_pos < 0:
+                break
+            search_from = data_type_pos + 4
+            if data_type_pos < 4:
                 continue
+            data_atom_start = data_type_pos - 4
+            atom = _read_mp4_atom(data, data_atom_start, moov_end)
+            if not atom:
+                continue
+            header_size, data_atom_end = atom
+            text_start = data_atom_start + header_size + 8
+            if text_start > data_atom_end:
+                continue
+            value = _decode_metadata_payload(data[text_start:data_atom_end])
+            if value and _looks_like_method_text(value):
+                return value
 
-            if value:
+        # Some 3GPP/custom boxes store text directly rather than in `data`.
+        # Restrict the fallback to printable strings inside moov and require a
+        # method marker, so compressed video bytes are never misidentified.
+        moov_payload = data[moov_start:moov_end]
+        for match in re.finditer(rb"[\x20-\x7e]{4,256}", moov_payload):
+            value = _clean_method_text(match.group(0).decode("ascii", errors="ignore"))
+            if value and _looks_like_method_text(value):
                 return value
 
     return ""
