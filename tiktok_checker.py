@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import asdict, dataclass
 from fractions import Fraction
 from pathlib import Path
@@ -36,6 +37,11 @@ LINE = "=" * 58
 TIKTOK_FORMAT_SELECTOR = (
     os.environ.get("TIKTOK_FORMAT_SELECTOR", "").strip()
     or "b[ext=mp4]/b/bv*+ba"
+)
+
+TEMP_DIRECTORY_PREFIXES = (
+    "telegram_tiktok_download_",
+    "tiktok_checker_",
 )
 
 
@@ -54,6 +60,7 @@ def get_temp_root() -> Path:
         if configured
         else Path(__file__).resolve().parent / ".bot_tmp"
     )
+    root = root.resolve()
 
     try:
         root.mkdir(parents=True, exist_ok=True)
@@ -66,6 +73,64 @@ def get_temp_root() -> Path:
         raise CheckerError(f"Temp path មិនមែនជា folder: {root}")
 
     return root
+
+
+def remove_managed_temp_directory(directory: Path) -> bool:
+    """Remove one bot-owned temp directory without touching unrelated paths."""
+    root = get_temp_root().resolve()
+    candidate = Path(directory)
+
+    try:
+        if candidate.is_symlink():
+            return False
+        resolved = candidate.resolve()
+    except OSError:
+        return False
+
+    if resolved.parent != root:
+        return False
+    if not any(
+        resolved.name.startswith(prefix) for prefix in TEMP_DIRECTORY_PREFIXES
+    ):
+        return False
+
+    try:
+        shutil.rmtree(resolved)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+
+    return not resolved.exists()
+
+
+def cleanup_stale_temp_directories(max_age_seconds: int = 0) -> list[Path]:
+    """Delete bot-owned temp directories left behind by a stopped process."""
+    root = get_temp_root()
+    cutoff = time.time() - max(0, max_age_seconds)
+    removed: list[Path] = []
+
+    try:
+        children = list(root.iterdir())
+    except OSError:
+        return removed
+
+    for child in children:
+        if child.is_symlink() or not child.is_dir():
+            continue
+        if not any(child.name.startswith(prefix) for prefix in TEMP_DIRECTORY_PREFIXES):
+            continue
+
+        try:
+            if child.stat().st_mtime > cutoff:
+                continue
+        except OSError:
+            continue
+
+        if remove_managed_temp_directory(child):
+            removed.append(child)
+
+    return removed
 
 
 class Color:

@@ -1,0 +1,8 @@
+.env
+.local_bot_api_enabled
+.bot_tmp/
+runtime/
+__pycache__/
+*.py[cod]
+cookies.txt
+*.mp4

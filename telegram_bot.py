@@ -27,11 +27,18 @@ from fps_api_server import start_fps_api_server
 from tiktok_checker import (
     CheckerError,
     VideoReport,
+    cleanup_stale_temp_directories,
     download_video,
     format_duration,
     get_temp_root,
     is_url,
     process_source,
+    remove_managed_temp_directory,
+)
+from video_compressor import (
+    CompressionError,
+    CompressionResult,
+    compress_for_telegram,
 )
 
 load_dotenv()
@@ -43,13 +50,43 @@ TELEGRAM_BOT_API_URL: Final[str] = (
 )
 MAX_CONCURRENT_JOBS: Final[int] = max(
     1,
-    int(os.getenv("MAX_CONCURRENT_JOBS", os.getenv("MAX_CONCURRENT_CHECKS", "2"))),
+    int(os.getenv("MAX_CONCURRENT_JOBS", os.getenv("MAX_CONCURRENT_CHECKS", "1"))),
 )
 JOB_TIMEOUT_SECONDS: Final[int] = max(
     60,
     int(os.getenv("JOB_TIMEOUT_SECONDS", os.getenv("CHECK_TIMEOUT_SECONDS", "420"))),
 )
+LOCAL_API_MAX_UPLOAD_MB: Final[int] = min(
+    2000,
+    max(1, int(os.getenv("LOCAL_API_MAX_UPLOAD_MB", "1990"))),
+)
+AUTO_COMPRESS_FOR_CLOUD: Final[bool] = os.getenv(
+    "AUTO_COMPRESS_FOR_CLOUD",
+    "true",
+).strip().casefold() not in {"0", "false", "no", "off"}
+CLOUD_UPLOAD_TARGET_MB: Final[float] = min(
+    48.0,
+    max(1.0, float(os.getenv("CLOUD_UPLOAD_TARGET_MB", "47"))),
+)
+CLOUD_UPLOAD_LIMIT_MB: Final[float] = 49.0
+COMPRESSION_MAX_SHORT_SIDE: Final[int] = max(
+    240,
+    int(os.getenv("COMPRESSION_MAX_SHORT_SIDE", "1080")),
+)
+COMPRESSION_PRESET: Final[str] = os.getenv(
+    "COMPRESSION_PRESET",
+    "medium",
+).strip() or "medium"
+COMPRESSION_TIMEOUT_SECONDS: Final[int] = max(
+    300,
+    int(os.getenv("COMPRESSION_TIMEOUT_SECONDS", "1800")),
+)
+MAX_CONCURRENT_COMPRESSIONS: Final[int] = max(
+    1,
+    int(os.getenv("MAX_CONCURRENT_COMPRESSIONS", "1")),
+)
 job_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
+compression_semaphore = asyncio.Semaphore(MAX_CONCURRENT_COMPRESSIONS)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -185,30 +222,89 @@ async def download_from_url(update: Update, url: str) -> None:
         parse_mode=ParseMode.HTML,
     )
 
+    temp_dir: Path | None = None
+
     try:
         async with job_semaphore:
             # Keep large downloads on the server's persistent disk allocation,
             # not the small container /tmp tmpfs.
             temp_root = get_temp_root()
-            with tempfile.TemporaryDirectory(
+            temp_name = tempfile.mkdtemp(
                 prefix="telegram_tiktok_download_",
                 dir=str(temp_root),
-            ) as temp_name:
-                temp_dir = Path(temp_name)
+            )
+            temp_dir = Path(temp_name)
+
+            try:
                 video_path = await asyncio.wait_for(
                     asyncio.to_thread(download_video, url, temp_dir),
                     timeout=JOB_TIMEOUT_SECONDS,
                 )
 
+                original_size_mb = video_path.stat().st_size / (1024 * 1024)
+                compression: CompressionResult | None = None
+
+                if (
+                    not TELEGRAM_BOT_API_URL
+                    and original_size_mb > CLOUD_UPLOAD_TARGET_MB
+                ):
+                    if not AUTO_COMPRESS_FOR_CLOUD:
+                        await status.edit_text(
+                            "❌ វីដេអូនេះលើសទំហំសុវត្ថិភាពរបស់ Telegram "
+                            "ហើយ automatic compression ត្រូវបានបិទ។"
+                        )
+                        return
+
+                    await status.edit_text(
+                        "🗜️ <b>កំពុងបង្ហាប់សម្រាប់ Telegram...</b>\n"
+                        f"📦 Original: <code>{original_size_mb:.2f} MB</code>\n"
+                        f"🎯 Target: <code>{CLOUD_UPLOAD_TARGET_MB:.0f} MB</code>\n"
+                        "🎞️ រក្សា FPS ដើម និងគុណភាព 1080p អតិបរមា។",
+                        parse_mode=ParseMode.HTML,
+                    )
+
+                    compressed_path = temp_dir / "video_telegram_high_quality.mp4"
+                    async with compression_semaphore:
+                        compression = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                compress_for_telegram,
+                                video_path,
+                                compressed_path,
+                                target_size_mb=CLOUD_UPLOAD_TARGET_MB,
+                                maximum_size_mb=CLOUD_UPLOAD_LIMIT_MB,
+                                max_short_side=COMPRESSION_MAX_SHORT_SIDE,
+                                preset=COMPRESSION_PRESET,
+                                timeout_seconds=COMPRESSION_TIMEOUT_SECONDS,
+                            ),
+                            timeout=COMPRESSION_TIMEOUT_SECONDS + 60,
+                        )
+                    video_path = compression.output_path
+
                 size_mb = video_path.stat().st_size / (1024 * 1024)
 
-                if not TELEGRAM_BOT_API_URL and size_mb > 49:
+                upload_limit_mb = (
+                    LOCAL_API_MAX_UPLOAD_MB if TELEGRAM_BOT_API_URL else 49
+                )
+                if size_mb > upload_limit_mb:
+                    api_name = (
+                        "Telegram Local Bot API"
+                        if TELEGRAM_BOT_API_URL
+                        else "Telegram Bot API ផ្លូវការ"
+                    )
                     await status.edit_text(
-                        "❌ វីដេអូនេះធំពេកសម្រាប់ Telegram Bot API ផ្លូវការ។\n"
+                        f"❌ វីដេអូនេះធំពេកសម្រាប់ {api_name}។\n"
                         f"📁 Size: {size_mb:.2f} MB\n"
-                        "💡 ប្រើ Telegram Local Bot API Server ដើម្បីផ្ញើ file ធំជាងនេះ។"
+                        f"📦 Limit ដែលបានកំណត់: {upload_limit_mb} MB"
                     )
                     return
+
+                # In local mode python-telegram-bot sends a file:// URI. The
+                # Bot API container sees this same path through a read-only
+                # shared volume, so the video is not copied into a second
+                # upload cache on the VPS.
+                if TELEGRAM_BOT_API_URL:
+                    temp_dir.chmod(0o755)
+                    video_path.chmod(0o644)
 
                 await status.edit_text(
                     f"📤 <b>កំពុងផ្ញើវីដេអូ...</b>\n"
@@ -219,34 +315,53 @@ async def download_from_url(update: Update, url: str) -> None:
                 caption = (
                     "✅ <b>Download បានជោគជ័យ</b>\n"
                     f"📁 Size: <code>{size_mb:.2f} MB</code>\n"
-                    "🗑️ Server temp file នឹងត្រូវលុបក្រោយផ្ញើចប់។"
                 )
+                if compression is not None:
+                    caption += (
+                        "🗜️ Original: "
+                        f"<code>{compression.original_size_mb:.2f} MB</code>\n"
+                        f"🎞️ FPS: <code>{compression.source_fps:.2f} → "
+                        f"{compression.output_fps:.2f}</code>\n"
+                        f"📐 Resolution: <code>{compression.source_width}x"
+                        f"{compression.source_height} → {compression.output_width}x"
+                        f"{compression.output_height}</code>\n"
+                    )
+                caption += "🗑️ Server temp files នឹងត្រូវលុបក្រោយផ្ញើចប់។"
 
-                with video_path.open("rb") as video_file:
-                    try:
-                        await message.reply_video(
-                            video=video_file,
-                            caption=caption,
-                            parse_mode=ParseMode.HTML,
-                            supports_streaming=True,
-                            read_timeout=JOB_TIMEOUT_SECONDS,
-                            write_timeout=JOB_TIMEOUT_SECONDS,
-                            connect_timeout=60,
-                            pool_timeout=60,
-                        )
-                    except BadRequest:
-                        # Some MP4 files cannot be sent as Telegram video; retry as document.
-                        video_file.seek(0)
-                        await message.reply_document(
-                            document=video_file,
-                            filename=video_path.name,
-                            caption=caption,
-                            parse_mode=ParseMode.HTML,
-                            read_timeout=JOB_TIMEOUT_SECONDS,
-                            write_timeout=JOB_TIMEOUT_SECONDS,
-                            connect_timeout=60,
-                            pool_timeout=60,
-                        )
+                try:
+                    await message.reply_video(
+                        video=video_path,
+                        caption=caption,
+                        parse_mode=ParseMode.HTML,
+                        supports_streaming=True,
+                        read_timeout=JOB_TIMEOUT_SECONDS,
+                        write_timeout=JOB_TIMEOUT_SECONDS,
+                        connect_timeout=60,
+                        pool_timeout=60,
+                    )
+                except BadRequest:
+                    # Some MP4 files cannot be sent as Telegram video; retry as document.
+                    await message.reply_document(
+                        document=video_path,
+                        filename=video_path.name,
+                        caption=caption,
+                        parse_mode=ParseMode.HTML,
+                        read_timeout=JOB_TIMEOUT_SECONDS,
+                        write_timeout=JOB_TIMEOUT_SECONDS,
+                        connect_timeout=60,
+                        pool_timeout=60,
+                    )
+            finally:
+                # Runs after success, Telegram rejection, timeout, cancellation,
+                # or any other error. This is the main disk-protection rule.
+                deleted = remove_managed_temp_directory(temp_dir)
+                if deleted:
+                    logger.info("Deleted temporary video directory: %s", temp_dir)
+                else:
+                    logger.warning(
+                        "Temporary video directory still exists: %s",
+                        temp_dir,
+                    )
 
         await status.delete()
 
@@ -256,6 +371,13 @@ async def download_from_url(update: Update, url: str) -> None:
         detail = escape(str(exc))[:3000]
         await status.edit_text(
             "❌ <b>មិនអាច Download វីដេអូនេះបាន</b>\n\n"
+            f"<code>{detail}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+    except CompressionError as exc:
+        detail = escape(str(exc))[:3000]
+        await status.edit_text(
+            "❌ <b>មិនអាចបង្ហាប់វីដេអូក្រោម 49 MB បាន</b>\n\n"
             f"<code>{detail}</code>",
             parse_mode=ParseMode.HTML,
         )
@@ -304,6 +426,15 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 def main() -> None:
+    # A hard reboot can bypass a Python finally block. Clear only directories
+    # owned by this bot before accepting new work; unrelated files are ignored.
+    stale_directories = cleanup_stale_temp_directories(max_age_seconds=0)
+    if stale_directories:
+        logger.info(
+            "Removed %d stale temporary directorie(s)",
+            len(stale_directories),
+        )
+
     # Start the HTTP FPS API in the same process as the Telegram bot.
     # PEACHY allocation port 3008 should point to this listener.
     try:

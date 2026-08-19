@@ -1,0 +1,59 @@
+services:
+  telegram-bot-api:
+    image: aiogram/telegram-bot-api:10.1
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TELEGRAM_LOCAL: "1"
+      TELEGRAM_VERBOSITY: "${TELEGRAM_VERBOSITY:-1}"
+      TELEGRAM_WORK_DIR: /var/lib/telegram-bot-api
+      TELEGRAM_TEMP_DIR: /var/lib/telegram-bot-api-temp
+    entrypoint:
+      - /bin/sh
+      - /opt/telegram-api-entrypoint.sh
+    volumes:
+      - telegram-api-data:/var/lib/telegram-bot-api
+      - telegram-api-temp:/var/lib/telegram-bot-api-temp
+      - bot-temp:/data/bot-temp:ro
+      - ./telegram-api-entrypoint.sh:/opt/telegram-api-entrypoint.sh:ro
+    expose:
+      - "8081"
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 8081"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  bot:
+    build:
+      context: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TELEGRAM_BOT_API_URL: http://telegram-bot-api:8081
+      BOT_TEMP_DIR: /data/bot-temp
+    depends_on:
+      telegram-bot-api:
+        condition: service_healthy
+    volumes:
+      - bot-temp:/data/bot-temp
+    ports:
+      - "${FPS_API_PORT:-3008}:${FPS_API_PORT:-3008}"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  telegram-api-data:
+  telegram-api-temp:
+  bot-temp:
